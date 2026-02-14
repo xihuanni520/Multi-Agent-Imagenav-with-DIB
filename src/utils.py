@@ -145,6 +145,17 @@ def get_config(exp_config, opts, run_type, model_dir, overwrite, note, debug, gl
     config = change_habitat_config(config)
     config.defrost()
 
+    # Expand dataset path template with num_agents if provided
+    try:
+        num_agents = int(getattr(config.habitat.task, "num_agents", 1))
+        data_path = getattr(config.habitat.dataset, "data_path", "")
+        if isinstance(data_path, str) and "{num_agents}" in data_path:
+            config.habitat.dataset.data_path = data_path.format(
+                num_agents=num_agents
+            )
+    except Exception:
+        pass
+
     if model_dir == None:
         model_dir = 'results/official'
 
@@ -180,6 +191,7 @@ def get_config(exp_config, opts, run_type, model_dir, overwrite, note, debug, gl
         run_dir = get_random_rundir(exp_dir=Path(model_dir), prefix=run_type, suffix=note)
         
         config.habitat_baselines.log_file = os.path.join(run_dir, 'log.txt')
+        config.habitat_baselines.tensorboard_dir = os.path.join(run_dir, 'tb')
         os.makedirs(run_dir, exist_ok=True)
         os.makedirs(config.habitat_baselines.tensorboard_dir, exist_ok=True)
         os.makedirs(config.habitat_baselines.checkpoint_folder, exist_ok=True)

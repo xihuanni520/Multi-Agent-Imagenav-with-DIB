@@ -8,6 +8,7 @@ import contextlib
 import os
 import random
 import time
+import re
 from src import utils
 from collections import defaultdict, deque
 from typing import Any, Dict, List, Optional, Tuple
@@ -132,6 +133,11 @@ class PPOTrainer(BaseRLTrainer):
         self._static_encoder = False
         self._encoder = None
         self._obs_space = None
+        self._multi_agent_enabled = False
+        self._num_agents = 1
+        self._num_rollout_envs = None
+        self._agent_alive = None
+        self._rollout_device = None
 
         # Distributed if the world size would be
         # greater than 1
@@ -147,6 +153,47 @@ class PPOTrainer(BaseRLTrainer):
     @obs_space.setter
     def obs_space(self, new_obs_space):
         self._obs_space = new_obs_space
+
+    def _maybe_enable_multi_agent(self):
+        ma_cfg = getattr(self.config.habitat_baselines, "multi_agent", None)
+        num_agents = int(getattr(self.config.habitat.task, "num_agents", 1))
+        if ma_cfg is not None and getattr(ma_cfg, "enabled", False):
+            num_agents = int(getattr(ma_cfg, "num_agents", num_agents))
+            self._multi_agent_enabled = True
+        else:
+            env_task = getattr(self.config.habitat, "env_task", "")
+            self._multi_agent_enabled = num_agents > 1 or (
+                isinstance(env_task, str) and "Multi" in env_task
+            )
+
+        if num_agents < 1:
+            raise ValueError("num_agents must be >= 1")
+        self._num_agents = num_agents
+        self._num_rollout_envs = (
+            self.envs.num_envs * self._num_agents
+            if self._multi_agent_enabled
+            else self.envs.num_envs
+        )
+
+    def _flatten_batch(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        if not self._multi_agent_enabled:
+            return batch
+        out = {}
+        for k, v in batch.items():
+            if torch.is_tensor(v) and v.dim() >= 2:
+                b, n = v.shape[0], v.shape[1]
+                out[k] = v.reshape(b * n, *v.shape[2:])
+            else:
+                out[k] = v
+        return out
+
+    def _flatten_np(self, arr: np.ndarray) -> np.ndarray:
+        if not self._multi_agent_enabled:
+            return arr
+        if arr.ndim >= 2:
+            b, n = arr.shape[0], arr.shape[1]
+            return arr.reshape(b * n, *arr.shape[2:])
+        return arr
 
     def _all_reduce(self, t: torch.Tensor) -> torch.Tensor:
         r"""All reduce helper method that moves things to the correct
@@ -309,6 +356,7 @@ class PPOTrainer(BaseRLTrainer):
         )
 
         self._init_envs()
+        self._maybe_enable_multi_agent()
 
         action_space = self.envs.action_spaces[0]
         self.policy_action_space = action_space
@@ -330,6 +378,11 @@ class PPOTrainer(BaseRLTrainer):
             torch.cuda.set_device(self.device)
         else:
             self.device = torch.device("cpu")
+
+        rollout_on_cpu = bool(getattr(ppo_cfg, "rollout_on_cpu", False))
+        if self._multi_agent_enabled:
+            rollout_on_cpu = True
+        self._rollout_device = torch.device("cpu") if rollout_on_cpu else self.device
 
         if rank0_only() and not os.path.isdir(
             self.config.habitat_baselines.checkpoint_folder
@@ -365,22 +418,29 @@ class PPOTrainer(BaseRLTrainer):
             )
 
         self._nbuffers = 2 if ppo_cfg.use_double_buffered_sampler else 1
+        if self._multi_agent_enabled and self._nbuffers != 1:
+            logger.warning(
+                "Multi-agent mode requires use_double_buffered_sampler=False. "
+                "Using single buffer."
+            )
+            self._nbuffers = 1
 
         self.rollouts = RolloutStorage(
             ppo_cfg.num_steps,
-            self.envs.num_envs,
+            self._num_rollout_envs,
             obs_space,
             self.policy_action_space,
             ppo_cfg.hidden_size,
             num_recurrent_layers=self.actor_critic.net.num_recurrent_layers,
-            is_double_buffered=ppo_cfg.use_double_buffered_sampler,
+            is_double_buffered=self._nbuffers == 2,
             action_shape=action_shape,
             discrete_actions=discrete_actions,
         )
-        self.rollouts.to(self.device)
+        self.rollouts.to(self._rollout_device)
 
         observations = self.envs.reset()
-        batch = batch_obs(observations, device=self.device)
+        batch = batch_obs(observations, device=self._rollout_device)
+        batch = self._flatten_batch(batch)
         batch = apply_obs_transforms_batch(batch, self.obs_transforms)  # type: ignore
 
         if self._static_encoder:
@@ -391,11 +451,26 @@ class PPOTrainer(BaseRLTrainer):
 
         self.rollouts.buffers["observations"][0] = batch  # type: ignore
 
-        self.current_episode_reward = torch.zeros(self.envs.num_envs, 1)
-        self.running_episode_stats = dict(
-            count=torch.zeros(self.envs.num_envs, 1),
-            reward=torch.zeros(self.envs.num_envs, 1),
+        current_reward_size = (
+            self._num_rollout_envs
+            if self._multi_agent_enabled
+            else self.envs.num_envs
         )
+        self.current_episode_reward = torch.zeros(
+            current_reward_size, 1, device=self._rollout_device
+        )
+        if self._multi_agent_enabled:
+            self._agent_alive = torch.ones(
+                self.envs.num_envs, self._num_agents, dtype=torch.bool
+            )
+        self.running_episode_stats = dict(
+            count=torch.zeros(current_reward_size, 1),
+            reward=torch.zeros(current_reward_size, 1),
+        )
+        if self._multi_agent_enabled:
+            self._agent_alive = torch.ones(
+                self.envs.num_envs, self._num_agents, dtype=torch.bool
+            )
         self.window_episode_stats = defaultdict(
             lambda: deque(maxlen=ppo_cfg.reward_window_size)
         )
@@ -497,6 +572,72 @@ class PPOTrainer(BaseRLTrainer):
         return results
 
     def _compute_actions_and_step_envs(self, buffer_index: int = 0):
+        if self._multi_agent_enabled:
+            if buffer_index != 0:
+                return
+            t_sample_action = time.time()
+            with inference_mode():
+                step_batch = self.rollouts.buffers[
+                    self.rollouts.current_rollout_step_idx
+                ]
+                if self._rollout_device != self.device:
+                    step_batch = step_batch.map(
+                        lambda v: v.to(self.device) if torch.is_tensor(v) else v
+                    )
+                profiling_wrapper.range_push("compute actions")
+                (
+                    values,
+                    actions,
+                    actions_log_probs,
+                    recurrent_hidden_states,
+                ) = self.actor_critic.act(
+                    step_batch["observations"],
+                    step_batch["recurrent_hidden_states"],
+                    step_batch["prev_actions"],
+                    step_batch["masks"],
+                )
+            self.pth_time += time.time() - t_sample_action
+            self.ac_infer_time += time.time() - t_sample_action
+            profiling_wrapper.range_pop()  # compute actions
+
+            t_step_env = time.time()
+            actions_cpu = actions.cpu()
+            if is_continuous_action_space(self.policy_action_space):
+                action_dim = actions_cpu.shape[-1]
+                actions_cpu = actions_cpu.view(
+                    self.envs.num_envs, self._num_agents, action_dim
+                )
+                for env_idx in range(self.envs.num_envs):
+                    act = np.clip(
+                        actions_cpu[env_idx].numpy(),
+                        self.policy_action_space.low,
+                        self.policy_action_space.high,
+                    )
+                    self.envs.async_step_at(env_idx, act)
+            else:
+                actions_cpu = actions_cpu.view(self.envs.num_envs, self._num_agents)
+                for env_idx in range(self.envs.num_envs):
+                    act = actions_cpu[env_idx].tolist()
+                    self.envs.async_step_at(env_idx, act)
+
+            self.env_time += time.time() - t_step_env
+
+            if self._rollout_device != self.device:
+                values = values.to(self._rollout_device)
+                actions = actions.to(self._rollout_device)
+                actions_log_probs = actions_log_probs.to(self._rollout_device)
+                recurrent_hidden_states = recurrent_hidden_states.to(
+                    self._rollout_device
+                )
+            self.rollouts.insert(
+                next_recurrent_hidden_states=recurrent_hidden_states,
+                actions=actions,
+                action_log_probs=actions_log_probs,
+                value_preds=values,
+                buffer_index=0,
+            )
+            return
+
         num_envs = self.envs.num_envs
         env_slice = slice(
             int(buffer_index * num_envs / self._nbuffers),
@@ -511,6 +652,10 @@ class PPOTrainer(BaseRLTrainer):
                 self.rollouts.current_rollout_step_idxs[buffer_index],
                 env_slice,
             ]
+            if self._rollout_device != self.device:
+                step_batch = step_batch.map(
+                    lambda v: v.to(self.device) if torch.is_tensor(v) else v
+                )
 
             profiling_wrapper.range_push("compute actions")
             (
@@ -524,7 +669,6 @@ class PPOTrainer(BaseRLTrainer):
                 step_batch["prev_actions"],
                 step_batch["masks"],
             )
-            
 
         self.pth_time += time.time() - t_sample_action
         self.ac_infer_time += time.time() - t_sample_action
@@ -533,22 +677,45 @@ class PPOTrainer(BaseRLTrainer):
 
         t_step_env = time.time()
 
-        for index_env, act in zip(
-            range(env_slice.start, env_slice.stop), actions.cpu().unbind(0)
-        ):
-            if is_continuous_action_space(self.policy_action_space):
-                # Clipping actions to the specified limits
-                act = np.clip(
-                    act.numpy(),
-                    self.policy_action_space.low,
-                    self.policy_action_space.high,
-                )
-            else:
-                act = act.item()
-            self.envs.async_step_at(index_env, act)
+        if self._multi_agent_enabled:
+            actions_env = actions.view(
+                num_envs, self._num_agents, *actions.shape[1:]
+            ).cpu()
+            for index_env in range(env_slice.start, env_slice.stop):
+                act = actions_env[index_env]
+                if is_continuous_action_space(self.policy_action_space):
+                    act = np.clip(
+                        act.numpy(),
+                        self.policy_action_space.low,
+                        self.policy_action_space.high,
+                    )
+                else:
+                    act = [a.item() for a in act.view(-1)]
+                self.envs.async_step_at(index_env, act)
+        else:
+            for index_env, act in zip(
+                range(env_slice.start, env_slice.stop), actions.cpu().unbind(0)
+            ):
+                if is_continuous_action_space(self.policy_action_space):
+                    # Clipping actions to the specified limits
+                    act = np.clip(
+                        act.numpy(),
+                        self.policy_action_space.low,
+                        self.policy_action_space.high,
+                    )
+                else:
+                    act = act.item()
+                self.envs.async_step_at(index_env, act)
 
         self.env_time += time.time() - t_step_env
 
+        if self._rollout_device != self.device:
+            values = values.to(self._rollout_device)
+            actions = actions.to(self._rollout_device)
+            actions_log_probs = actions_log_probs.to(self._rollout_device)
+            recurrent_hidden_states = recurrent_hidden_states.to(
+                self._rollout_device
+            )
         self.rollouts.insert(
             next_recurrent_hidden_states=recurrent_hidden_states,
             actions=actions,
@@ -558,6 +725,129 @@ class PPOTrainer(BaseRLTrainer):
         )
 
     def _collect_environment_result(self, buffer_index: int = 0):
+        if self._multi_agent_enabled:
+            if buffer_index != 0:
+                return 0
+            t_step_env = time.time()
+            outputs = [
+                self.envs.wait_step_at(index_env)
+                for index_env in range(self.envs.num_envs)
+            ]
+
+            observations, rewards_l, dones, infos = [
+                list(x) for x in zip(*outputs)
+            ]
+
+            self.env_time += time.time() - t_step_env
+
+            t_update_stats = time.time()
+            batch = batch_obs(observations, device=self.device)
+            batch = self._flatten_batch(batch)
+            batch = apply_obs_transforms_batch(batch, self.obs_transforms)  # type: ignore
+
+            rewards_np = np.stack(rewards_l, axis=0)  # (B, N)
+            rewards = torch.tensor(
+                rewards_np,
+                dtype=torch.float,
+                device=self.current_episode_reward.device,
+            ).view(-1, 1)
+
+            agent_done_np = np.array(
+                [info.get("agent_done", [False] * self._num_agents) for info in infos],
+                dtype=bool,
+            )
+            not_done_masks = torch.tensor(
+                ~agent_done_np,
+                dtype=torch.bool,
+                device=self.current_episode_reward.device,
+            ).view(-1, 1)
+
+            # Update per-agent episode rewards/stats
+            rewards_bna = torch.tensor(
+                rewards_np,
+                dtype=torch.float,
+                device=self.current_episode_reward.device,
+            ).unsqueeze(-1)
+            current_reward = self.current_episode_reward.view(
+                self.envs.num_envs, self._num_agents, 1
+            )
+            current_reward += rewards_bna
+
+            agent_done = torch.tensor(
+                agent_done_np, dtype=torch.bool, device=current_reward.device
+            )
+            agent_alive = self._agent_alive.to(device=current_reward.device)
+            just_done = agent_done & agent_alive
+            self._agent_alive = (agent_alive & ~agent_done).cpu()
+
+            done_masks = just_done.view(-1, 1)
+            current_ep_reward = current_reward.view(-1, 1)
+            self.running_episode_stats["reward"] += current_ep_reward.where(
+                done_masks, current_ep_reward.new_zeros(())
+            )  # type: ignore
+            self.running_episode_stats["count"] += done_masks.float()  # type: ignore
+
+            # Log multi-agent metrics from infos
+            metrics_by_env = self._extract_scalars_from_infos(infos)
+            if len(metrics_by_env) > 0:
+                device = self.current_episode_reward.device
+                for k, v_k in metrics_by_env.items():
+                    v_env = torch.tensor(
+                        v_k, dtype=torch.float, device=device
+                    ).view(self.envs.num_envs, 1)
+
+                    m = re.match(
+                        r"multi_agent\\.(success|spl|distance)_(\\d+)$", k
+                    )
+                    if m is not None:
+                        agent_idx = int(m.group(2))
+                        v_bn = torch.zeros(
+                            (self.envs.num_envs, self._num_agents),
+                            device=device,
+                            dtype=torch.float,
+                        )
+                        v_bn[:, agent_idx] = v_env.squeeze(1)
+                    else:
+                        v_bn = v_env.repeat(1, self._num_agents)
+
+                    v_flat = v_bn.reshape(-1, 1)
+                    if k not in self.running_episode_stats:
+                        self.running_episode_stats[k] = torch.zeros_like(
+                            self.running_episode_stats["count"]
+                        )
+                    self.running_episode_stats[k] += v_flat.where(
+                        done_masks, v_flat.new_zeros(())
+                    )  # type: ignore
+
+            # Reset rewards for finished agents
+            current_reward.masked_fill_(just_done.unsqueeze(-1), 0.0)
+            self.current_episode_reward = current_reward.view(-1, 1)
+
+            # Reset agent_alive on env reset
+            for env_idx, done_env in enumerate(dones):
+                if done_env:
+                    self._agent_alive[env_idx] = True
+
+            if self._static_encoder:
+                with inference_mode():
+                    batch[
+                        PointNavResNetNet.PRETRAINED_VISUAL_FEATURES_KEY
+                    ] = self._encoder(batch)
+
+            self.rollouts.insert(
+                next_observations=batch,
+                rewards=rewards,
+                next_masks=not_done_masks,
+                buffer_index=0,
+            )
+
+            self.rollouts.advance_rollout(0)
+
+            self.pth_time += time.time() - t_update_stats
+            self.update_stat_time += time.time() - t_update_stats
+
+            return self.envs.num_envs
+
         num_envs = self.envs.num_envs
         env_slice = slice(
             int(buffer_index * num_envs / self._nbuffers),
@@ -645,6 +935,10 @@ class PPOTrainer(BaseRLTrainer):
             step_batch = self.rollouts.buffers[
                 self.rollouts.current_rollout_step_idx
             ]
+            if self._rollout_device != self.device:
+                step_batch = step_batch.map(
+                    lambda v: v.to(self.device) if torch.is_tensor(v) else v
+                )
 
             next_value = self.actor_critic.get_value(
                 step_batch["observations"],
@@ -652,6 +946,8 @@ class PPOTrainer(BaseRLTrainer):
                 step_batch["prev_actions"],
                 step_batch["masks"],
             )
+        if self._rollout_device != self.device:
+            next_value = next_value.to(self._rollout_device)
 
         self.rollouts.compute_returns(
             next_value, ppo_cfg.use_gae, ppo_cfg.gamma, ppo_cfg.tau
@@ -981,6 +1277,11 @@ class PPOTrainer(BaseRLTrainer):
         """
         if self._is_distributed:
             raise RuntimeError("Evaluation does not support distributed mode")
+        self._maybe_enable_multi_agent()
+        if self._multi_agent_enabled:
+            raise NotImplementedError(
+                "Multi-agent eval is not implemented in this runnable version."
+            )
 
         # Map location CPU is almost always better than mapping to a CUDA device.
         if self.config.habitat_baselines.eval.should_load_ckpt:

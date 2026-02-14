@@ -4,4 +4,3 @@ habitat_baselines:
       goal_backbone: none
       backbone: midfusion_resnet9
       film_layers: '[0,1,2,3]'
-  num_environments: 10

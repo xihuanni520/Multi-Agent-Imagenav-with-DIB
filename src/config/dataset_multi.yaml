@@ -1,0 +1,5 @@
+habitat:
+  dataset:
+    type: MultiImageNav-v1
+    split: train
+    data_path: data/datasets/imagenav_multi/gibson/v1/{split}/{split}.json.gz
