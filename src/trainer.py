@@ -293,14 +293,29 @@ class PPOTrainer(BaseRLTrainer):
             resume_state = load_resume_state(self.config)
 
         if resume_state is not None:
+            # Runtime output paths can legitimately differ across restarts.
+            cur_log_file = self.config.habitat_baselines.log_file
+            cur_tb_dir = self.config.habitat_baselines.tensorboard_dir
+            cur_video_dir = self.config.habitat_baselines.video_dir
+
             unmatch_config = utils.compare_config(self.config, resume_state["config"])
-            _ = unmatch_config.pop('habitat_baselines.log_file')
+            ignore_keys = {
+                "habitat_baselines.log_file",
+                "habitat_baselines.tensorboard_dir",
+                "habitat_baselines.video_dir",
+            }
+            for k in ignore_keys:
+                _ = unmatch_config.pop(k, None)
             if rank0_only() and len(unmatch_config) > 0:
                 raise TypeError(
                     "Current config does not match with resume state!\n{}".format(unmatch_config)
                 )
-            
+
             self.config: Config = resume_state["config"]
+            with read_write(self.config):
+                self.config.habitat_baselines.log_file = cur_log_file
+                self.config.habitat_baselines.tensorboard_dir = cur_tb_dir
+                self.config.habitat_baselines.video_dir = cur_video_dir
 
     def _init_train(self, resume_state=None):
         if self.config.habitat_baselines.rl.ddppo.force_distributed:
