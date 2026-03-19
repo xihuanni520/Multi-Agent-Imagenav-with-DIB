@@ -34,7 +34,7 @@ def plot_evaluation(dataset_paths_dict):
     plt.figure(figsize=(10, 6))
     
     # 这里我们画出所有N的分布，或者只画你指定的某一个主要N
-    target_n = list(stats.keys())[1] # 取第一个N来画直方图
+    target_n = list(stats.keys())[0] # 取第一个N来画直方图
     data_to_hist = stats[target_n]
     
     plt.hist(data_to_hist, bins=50, color='skyblue', edgecolor='black', alpha=0.7)
@@ -45,7 +45,7 @@ def plot_evaluation(dataset_paths_dict):
     
     # 插入图片占位符 (如果需要动态生成图片，此处为逻辑)
     # 
-    plt.savefig("plot1_dist_distribution_4.png")
+    plt.savefig("plot1_dist_distribution_new_3.png")
     plt.show()
 
     # --- 绘图 2: N vs 平均最短路径长度 ---

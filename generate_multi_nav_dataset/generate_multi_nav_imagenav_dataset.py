@@ -33,7 +33,7 @@ class MultiAgentDatasetGenerator:
         
         # 配置参数 (你可以根据需要调整)
         self.min_geo_dist = 2.0    # 最小路径长度 (m)
-        self.max_geo_dist = 20.0   # 最大路径长度 (m)
+        self.max_geo_dist = 10.0   # 最大路径长度 (m)
         self.agent_clearance = 1.5 # Agent之间出生点的最小间距 (m)
         self.max_retries = 2000    # 采样重试次数
 
@@ -221,9 +221,9 @@ if __name__ == "__main__":
     # 生成 TRAIN 集 (72个场景)
     gen_train = MultiAgentDatasetGenerator(SCENE_DIR, SAVE_DIR_TRAIN)
     # 例如：生成 3 个 Agent，每个场景 100 个 Episode = 总共 7200 个 Episode
-    gen_train.generate(split='train', num_agents=4, num_episodes_per_scene=9000, mode='independent')
+    gen_train.generate(split='train', num_agents=3, num_episodes_per_scene=9000, mode='independent')
 
     # 生成 VAL 集 (14个场景)
     gen_val = MultiAgentDatasetGenerator(SCENE_DIR, SAVE_DIR_VAL)
     # 例如：生成 3 个 Agent，每个场景 20 个 Episode = 总共 280 个 Episode
-    gen_val.generate(split='val', num_agents=4, num_episodes_per_scene=300, mode='independent')
+    gen_val.generate(split='val', num_agents=3, num_episodes_per_scene=300, mode='independent')

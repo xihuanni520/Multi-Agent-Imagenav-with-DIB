@@ -4,7 +4,11 @@ habitat:
     type: gibson
     max_episode_steps: 1000
     iterator_options:
-      max_scene_repeat_steps: 50000
+      shuffle: True
+      group_by_scene: True
+      max_scene_repeat_steps: 8000
+      max_scene_repeat_episodes: 60
+      step_repetition_range: 0.5
   simulator:
     scene:
       "data/scene_datasets/gibson/Ackermanville.glb"
@@ -18,7 +22,8 @@ habitat:
   task:
     type: Nav-v0
     end_on_success: False
-    parallel_sub_envs: True
+    parallel_sub_envs: False
+    multi_agent_process_mode: True
     reward_measure: "distance_to_goal_reward"
     success_measure: "spl"
     sensors: ["imagegoal_sensor_v2", "panoramic_rgb_sensor"]

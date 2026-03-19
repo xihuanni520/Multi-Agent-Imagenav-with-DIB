@@ -10,7 +10,7 @@ import random
 import time
 import re
 from src import utils
-from collections import defaultdict, deque
+from collections import Counter, defaultdict, deque
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -71,6 +71,7 @@ from habitat_baselines.utils.common import (
 )
 from src.policy import NavNetPolicy
 from src.visualization import observations_to_image
+from src.environment import construct_multi_agent_process_envs
 
 
 def init_distrib_nccl(
@@ -138,10 +139,14 @@ class PPOTrainer(BaseRLTrainer):
         self._num_rollout_envs = None
         self._agent_alive = None
         self._rollout_device = None
+        self._multi_agent_process_mode = False
 
         # Distributed if the world size would be
         # greater than 1
-        self._is_distributed = get_distrib_size()[2] > 1
+        local_rank, world_rank, world_size = get_distrib_size()
+        self._is_distributed = world_size > 1
+        self._world_rank = int(world_rank)
+        self._world_size = int(world_size)
 
     @property
     def obs_space(self):
@@ -157,6 +162,9 @@ class PPOTrainer(BaseRLTrainer):
     def _maybe_enable_multi_agent(self):
         ma_cfg = getattr(self.config.habitat_baselines, "multi_agent", None)
         num_agents = int(getattr(self.config.habitat.task, "num_agents", 1))
+        self._multi_agent_process_mode = bool(
+            getattr(self.config.habitat.task, "multi_agent_process_mode", False)
+        )
         if ma_cfg is not None and getattr(ma_cfg, "enabled", False):
             num_agents = int(getattr(ma_cfg, "num_agents", num_agents))
             self._multi_agent_enabled = True
@@ -169,14 +177,17 @@ class PPOTrainer(BaseRLTrainer):
         if num_agents < 1:
             raise ValueError("num_agents must be >= 1")
         self._num_agents = num_agents
-        self._num_rollout_envs = (
-            self.envs.num_envs * self._num_agents
-            if self._multi_agent_enabled
-            else self.envs.num_envs
-        )
+        if self._multi_agent_process_mode:
+            self._num_rollout_envs = self.envs.num_envs
+        else:
+            self._num_rollout_envs = (
+                self.envs.num_envs * self._num_agents
+                if self._multi_agent_enabled
+                else self.envs.num_envs
+            )
 
     def _flatten_batch(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        if not self._multi_agent_enabled:
+        if (not self._multi_agent_enabled) or self._multi_agent_process_mode:
             return batch
         out = {}
         for k, v in batch.items():
@@ -188,7 +199,7 @@ class PPOTrainer(BaseRLTrainer):
         return out
 
     def _flatten_np(self, arr: np.ndarray) -> np.ndarray:
-        if not self._multi_agent_enabled:
+        if (not self._multi_agent_enabled) or self._multi_agent_process_mode:
             return arr
         if arr.ndim >= 2:
             b, n = arr.shape[0], arr.shape[1]
@@ -282,11 +293,20 @@ class PPOTrainer(BaseRLTrainer):
         if config is None:
             config = self.config
 
-        self.envs = construct_envs(
-            config,
-            workers_ignore_signals=is_slurm_batch_job(),
-            enforce_scenes_greater_eq_environments=is_eval,
-        )
+        if bool(getattr(config.habitat.task, "multi_agent_process_mode", False)):
+            self.envs = construct_multi_agent_process_envs(
+                config,
+                workers_ignore_signals=is_slurm_batch_job(),
+                enforce_scenes_greater_eq_environments=is_eval,
+                world_rank=self._world_rank,
+                world_size=self._world_size,
+            )
+        else:
+            self.envs = construct_envs(
+                config,
+                workers_ignore_signals=is_slurm_batch_job(),
+                enforce_scenes_greater_eq_environments=is_eval,
+            )
 
     def _resume_config(self, resume_state=None):
         if resume_state is None:
@@ -325,6 +345,8 @@ class PPOTrainer(BaseRLTrainer):
 
         if self._is_distributed:
             local_rank, world_rank, world_size = get_distrib_size()
+            self._world_rank = int(world_rank)
+            self._world_size = int(world_size)
             print('local rank: {}, world rank: {}, world size: {}'.format(local_rank, world_rank, world_size))
 
             local_rank, tcp_store = init_distrib_nccl(
@@ -361,6 +383,9 @@ class PPOTrainer(BaseRLTrainer):
                 "rollout_tracker", tcp_store
             )
             self.num_rollouts_done_store.set("num_done", "0")
+        else:
+            self._world_rank = 0
+            self._world_size = 1
 
         if rank0_only() and self.config.habitat_baselines.verbose:
             logger.info(f"config: {self.config}")
@@ -395,7 +420,7 @@ class PPOTrainer(BaseRLTrainer):
             self.device = torch.device("cpu")
 
         rollout_on_cpu = bool(getattr(ppo_cfg, "rollout_on_cpu", False))
-        if self._multi_agent_enabled:
+        if self._multi_agent_enabled and not self._multi_agent_process_mode:
             rollout_on_cpu = True
         self._rollout_device = torch.device("cpu") if rollout_on_cpu else self.device
 
@@ -433,7 +458,11 @@ class PPOTrainer(BaseRLTrainer):
             )
 
         self._nbuffers = 2 if ppo_cfg.use_double_buffered_sampler else 1
-        if self._multi_agent_enabled and self._nbuffers != 1:
+        if (
+            self._multi_agent_enabled
+            and not self._multi_agent_process_mode
+            and self._nbuffers != 1
+        ):
             logger.warning(
                 "Multi-agent mode requires use_double_buffered_sampler=False. "
                 "Using single buffer."
@@ -474,7 +503,7 @@ class PPOTrainer(BaseRLTrainer):
         self.current_episode_reward = torch.zeros(
             current_reward_size, 1, device=self._rollout_device
         )
-        if self._multi_agent_enabled:
+        if self._multi_agent_enabled and not self._multi_agent_process_mode:
             self._agent_alive = torch.ones(
                 self.envs.num_envs, self._num_agents, dtype=torch.bool
             )
@@ -482,12 +511,17 @@ class PPOTrainer(BaseRLTrainer):
             count=torch.zeros(current_reward_size, 1),
             reward=torch.zeros(current_reward_size, 1),
         )
-        if self._multi_agent_enabled:
+        if self._multi_agent_enabled and not self._multi_agent_process_mode:
             self._agent_alive = torch.ones(
                 self.envs.num_envs, self._num_agents, dtype=torch.bool
             )
         self.window_episode_stats = defaultdict(
             lambda: deque(maxlen=ppo_cfg.reward_window_size)
+        )
+        self.window_episode_scenes = deque(maxlen=ppo_cfg.reward_window_size)
+        self.seen_scenes_cumulative = set()
+        self.rank_scene_pool_size = int(
+            getattr(self.envs, "rank_scene_pool_size", 0)
         )
 
         self.env_time = 0.0
@@ -545,7 +579,14 @@ class PPOTrainer(BaseRLTrainer):
         """
         return torch.load(checkpoint_path, *args, **kwargs)
 
-    METRICS_BLACKLIST = {"top_down_map", "collisions.is_collision"}
+    METRICS_BLACKLIST = {
+        "top_down_map",
+        "collisions.is_collision",
+        "agent_done",
+        "agent_id",
+        "group_id",
+        "group_step",
+    }
 
     @classmethod
     def _extract_scalars_from_info(
@@ -578,16 +619,73 @@ class PPOTrainer(BaseRLTrainer):
     def _extract_scalars_from_infos(
         cls, infos: List[Dict[str, Any]]
     ) -> Dict[str, List[float]]:
-
-        results = defaultdict(list)
+        results = defaultdict(lambda: [0.0 for _ in range(len(infos))])
         for i in range(len(infos)):
             for k, v in cls._extract_scalars_from_info(infos[i]).items():
-                results[k].append(v)
+                results[k][i] = v
 
         return results
 
+    @staticmethod
+    def _scene_label(scene_id: str) -> str:
+        if not isinstance(scene_id, str):
+            return str(scene_id)
+        return os.path.basename(scene_id)
+
+    def _record_completed_episode_scenes(
+        self, infos: List[Dict[str, Any]], dones: List[bool]
+    ) -> None:
+        seen_episode_keys = set()
+        for idx, (info, done) in enumerate(zip(infos, dones)):
+            if (not done) or (not isinstance(info, dict)):
+                continue
+
+            scene_id = info.get("scene_id", "")
+            if not isinstance(scene_id, str) or len(scene_id) == 0:
+                continue
+
+            group_episode_id = info.get(
+                "group_episode_id", info.get("episode_id", "")
+            )
+            if not isinstance(group_episode_id, str):
+                group_episode_id = ""
+
+            if self._multi_agent_process_mode:
+                group_id = info.get("group_id", -1)
+                try:
+                    group_id = int(group_id)
+                except Exception:
+                    group_id = -1
+                episode_key = (scene_id, group_episode_id or f"env{idx}", group_id)
+            else:
+                episode_key = (scene_id, group_episode_id or f"env{idx}", idx)
+
+            if episode_key in seen_episode_keys:
+                continue
+
+            seen_episode_keys.add(episode_key)
+            self.window_episode_scenes.append(scene_id)
+            self.seen_scenes_cumulative.add(scene_id)
+
+    def _get_window_scene_summary(
+        self, top_k: int = 5
+    ) -> Tuple[str, int, float]:
+        if len(self.window_episode_scenes) == 0:
+            return "", 0, 0.0
+
+        counts = Counter(self.window_episode_scenes)
+        total = sum(counts.values())
+        _, top_count = counts.most_common(1)[0]
+        summary = ", ".join(
+            [
+                f"{self._scene_label(scene_id)}={count}/{total}"
+                for scene_id, count in counts.most_common(top_k)
+            ]
+        )
+        return summary, len(counts), float(top_count) / float(total)
+
     def _compute_actions_and_step_envs(self, buffer_index: int = 0):
-        if self._multi_agent_enabled:
+        if self._multi_agent_enabled and not self._multi_agent_process_mode:
             if buffer_index != 0:
                 return
             t_sample_action = time.time()
@@ -692,7 +790,7 @@ class PPOTrainer(BaseRLTrainer):
 
         t_step_env = time.time()
 
-        if self._multi_agent_enabled:
+        if self._multi_agent_enabled and not self._multi_agent_process_mode:
             actions_env = actions.view(
                 num_envs, self._num_agents, *actions.shape[1:]
             ).cpu()
@@ -740,7 +838,7 @@ class PPOTrainer(BaseRLTrainer):
         )
 
     def _collect_environment_result(self, buffer_index: int = 0):
-        if self._multi_agent_enabled:
+        if self._multi_agent_enabled and not self._multi_agent_process_mode:
             if buffer_index != 0:
                 return 0
             t_step_env = time.time()
@@ -834,6 +932,8 @@ class PPOTrainer(BaseRLTrainer):
                         done_masks, v_flat.new_zeros(())
                     )  # type: ignore
 
+            self._record_completed_episode_scenes(infos, dones)
+
             # Reset rewards for finished agents
             current_reward.masked_fill_(just_done.unsqueeze(-1), 0.0)
             self.current_episode_reward = current_reward.view(-1, 1)
@@ -914,6 +1014,8 @@ class PPOTrainer(BaseRLTrainer):
                     self.running_episode_stats["count"]
                 )
             self.running_episode_stats[k][env_slice] += v.where(done_masks, v.new_zeros(()))  # type: ignore
+
+        self._record_completed_episode_scenes(infos, dones)
 
         self.current_episode_reward[env_slice].masked_fill_(done_masks, 0.0)
 
@@ -1044,6 +1146,43 @@ class PPOTrainer(BaseRLTrainer):
             writer.add_scalar(f"metrics/{k}", v, self.num_steps_done)
         for k, v in losses.items():
             writer.add_scalar(f"learner/{k}", v, self.num_steps_done)
+
+        scene_summary, unique_scene_count, top_scene_share = (
+            self._get_window_scene_summary()
+        )
+        writer.add_scalar(
+            "debug/seen_scenes_cumulative_local",
+            len(self.seen_scenes_cumulative),
+            self.num_steps_done,
+        )
+        if self.rank_scene_pool_size > 0:
+            writer.add_scalar(
+                "debug/seen_scene_fraction_local",
+                float(len(self.seen_scenes_cumulative))
+                / float(self.rank_scene_pool_size),
+                self.num_steps_done,
+            )
+        if scene_summary:
+            writer.add_scalar(
+                "debug/window_unique_scenes_local",
+                unique_scene_count,
+                self.num_steps_done,
+            )
+            writer.add_scalar(
+                "debug/window_top_scene_share_local",
+                top_scene_share,
+                self.num_steps_done,
+            )
+            logger.info(
+                "window-scenes(local-rank view, last %d completed episodes): %s",
+                len(self.window_episode_scenes),
+                scene_summary,
+            )
+            logger.info(
+                "seen-scenes(local-rank cumulative): %d/%d",
+                len(self.seen_scenes_cumulative),
+                self.rank_scene_pool_size,
+            )
 
         fps = self.num_steps_done / ((time.time() - self.t_start) + prev_time)
         writer.add_scalar("perf/fps", fps, self.num_steps_done)
