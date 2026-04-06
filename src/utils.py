@@ -150,8 +150,8 @@ def get_config(exp_config, opts, run_type, model_dir, overwrite, note, debug, gl
         num_agents = int(getattr(config.habitat.task, "num_agents", 1))
         data_path = getattr(config.habitat.dataset, "data_path", "")
         if isinstance(data_path, str) and "{num_agents}" in data_path:
-            config.habitat.dataset.data_path = data_path.format(
-                num_agents=num_agents
+            config.habitat.dataset.data_path = data_path.replace(
+                "{num_agents}", str(num_agents)
             )
     except Exception:
         pass

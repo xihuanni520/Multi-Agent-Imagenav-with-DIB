@@ -49,6 +49,6 @@ habitat:
   dataset:
     type: MultiImageNav-v1
     split: train
-    data_path: /home/cyf/FGPrompt/data/datasets/multinav/gibson/v1/train/content/train_{num_agents}_agents_independent.json.gz
+    data_path: /home/cyf/FGPrompt/data/datasets/multinav/gibson/v1/{split}/content/{split}_{num_agents}_agents_independent.json.gz
     scenes_dir: /home/cyf/FGPrompt/data/scene_datasets
     clip_goal_feature: data/datasets_subtasknav/gibson/goal_clip_features.db

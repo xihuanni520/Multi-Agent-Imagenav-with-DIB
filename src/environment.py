@@ -192,14 +192,20 @@ class MultiAgentProcessVectorEnv:
         self.observation_spaces = []
         self.action_spaces = []
         self.orig_action_spaces = []
+        self.number_of_episodes = []
         for conn in self._parent_conns:
             cmd, payload = conn.recv()
             if cmd != "spaces":
                 raise RuntimeError(f"Unexpected worker init message: {cmd}")
-            obs_space, action_space, orig_action_space = payload
+            if len(payload) == 4:
+                obs_space, action_space, orig_action_space, num_eps = payload
+            else:
+                obs_space, action_space, orig_action_space = payload
+                num_eps = -1
             self.observation_spaces.append(obs_space)
             self.action_spaces.append(action_space)
             self.orig_action_spaces.append(orig_action_space)
+            self.number_of_episodes.append(int(num_eps))
 
     @property
     def num_envs(self):
@@ -220,10 +226,38 @@ class MultiAgentProcessVectorEnv:
     def wait_step_at(self, index_env: int):
         return self._parent_conns[index_env].recv()
 
+    def step(self, actions):
+        if len(actions) != self.num_envs:
+            raise ValueError(
+                f"Expected {self.num_envs} actions, got {len(actions)}"
+            )
+        for idx, action in enumerate(actions):
+            self.async_step_at(idx, action)
+        return [self.wait_step_at(idx) for idx in range(self.num_envs)]
+
     def current_episodes(self):
         for conn in self._parent_conns:
             conn.send(("current_episode", None))
         return [conn.recv() for conn in self._parent_conns]
+
+    def pause_at(self, index_env: int) -> None:
+        conn = self._parent_conns.pop(index_env)
+        worker = self._workers.pop(index_env)
+        self.observation_spaces.pop(index_env)
+        self.action_spaces.pop(index_env)
+        self.orig_action_spaces.pop(index_env)
+        self.number_of_episodes.pop(index_env)
+        try:
+            conn.send(("close", None))
+        except Exception:
+            pass
+        try:
+            conn.close()
+        except Exception:
+            pass
+        worker.join(timeout=5.0)
+        if worker.is_alive():
+            worker.terminate()
 
     def close(self):
         if self._closed:
@@ -806,6 +840,13 @@ def _multi_agent_process_worker(
     try:
         env = _make_multi_agent_process_env_fn(*env_fn_args)
         pending_reset = env.reset()
+        num_eps = getattr(env, "number_of_episodes", -1)
+        if callable(num_eps):
+            num_eps = num_eps()
+        try:
+            num_eps = int(num_eps)
+        except Exception:
+            num_eps = -1
         child_conn.send(
             (
                 "spaces",
@@ -813,6 +854,7 @@ def _multi_agent_process_worker(
                     env.observation_space,
                     env.action_space,
                     getattr(env, "original_action_space", env.action_space),
+                    num_eps,
                 ),
             )
         )

@@ -148,6 +148,29 @@ class PPOTrainer(BaseRLTrainer):
         self._world_rank = int(world_rank)
         self._world_size = int(world_size)
 
+    @staticmethod
+    def _resolve_dataset_path_template(
+        data_path: Any, split: str, num_agents: int
+    ) -> Any:
+        if not isinstance(data_path, str):
+            return data_path
+        resolved = data_path.replace("{num_agents}", str(num_agents))
+        if "{split}" in resolved:
+            try:
+                resolved = resolved.format(split=split)
+            except Exception:
+                pass
+        return resolved
+
+    def eval(self) -> None:
+        if self._is_distributed and self._world_rank != 0:
+            logger.info(
+                "Skipping eval loop on non-zero rank (%d).",
+                self._world_rank,
+            )
+            return
+        super().eval()
+
     @property
     def obs_space(self):
         if self._obs_space is None and self.envs is not None:
@@ -177,6 +200,9 @@ class PPOTrainer(BaseRLTrainer):
         if num_agents < 1:
             raise ValueError("num_agents must be >= 1")
         self._num_agents = num_agents
+        if self.envs is None:
+            self._num_rollout_envs = None
+            return
         if self._multi_agent_process_mode:
             self._num_rollout_envs = self.envs.num_envs
         else:
@@ -326,6 +352,21 @@ class PPOTrainer(BaseRLTrainer):
             }
             for k in ignore_keys:
                 _ = unmatch_config.pop(k, None)
+            data_path_key = "habitat.dataset.data_path"
+            if data_path_key in unmatch_config:
+                cur_path = self._resolve_dataset_path_template(
+                    getattr(self.config.habitat.dataset, "data_path", None),
+                    str(getattr(self.config.habitat.dataset, "split", "train")),
+                    int(getattr(self.config.habitat.task, "num_agents", 1)),
+                )
+                prev_cfg = resume_state["config"]
+                prev_path = self._resolve_dataset_path_template(
+                    getattr(prev_cfg.habitat.dataset, "data_path", None),
+                    str(getattr(prev_cfg.habitat.dataset, "split", "train")),
+                    int(getattr(prev_cfg.habitat.task, "num_agents", 1)),
+                )
+                if cur_path == prev_path:
+                    _ = unmatch_config.pop(data_path_key, None)
             if rank0_only() and len(unmatch_config) > 0:
                 raise TypeError(
                     "Current config does not match with resume state!\n{}".format(unmatch_config)
@@ -1430,9 +1471,18 @@ class PPOTrainer(BaseRLTrainer):
             None
         """
         if self._is_distributed:
-            raise RuntimeError("Evaluation does not support distributed mode")
+            if self._world_rank != 0:
+                logger.info(
+                    "Skipping evaluation on non-zero rank (%d).",
+                    self._world_rank,
+                )
+                return
+            logger.info(
+                "Distributed launch detected in eval; running evaluation only on rank 0."
+            )
+            self._is_distributed = False
         self._maybe_enable_multi_agent()
-        if self._multi_agent_enabled:
+        if self._multi_agent_enabled and not self._multi_agent_process_mode:
             raise NotImplementedError(
                 "Multi-agent eval is not implemented in this runnable version."
             )
@@ -1502,24 +1552,23 @@ class PPOTrainer(BaseRLTrainer):
         batch = batch_obs(observations, device=self.device)
         batch = apply_obs_transforms_batch(batch, self.obs_transforms)  # type: ignore
 
-        current_episode_reward = torch.zeros(
-            self.envs.num_envs, 1, device="cpu"
-        )
+        eval_num_envs = self.envs.num_envs
+        current_episode_reward = torch.zeros(eval_num_envs, 1, device="cpu")
 
         test_recurrent_hidden_states = torch.zeros(
-            self.config.habitat_baselines.num_environments,
+            eval_num_envs,
             self.actor_critic.num_recurrent_layers,
             ppo_cfg.hidden_size,
             device=self.device,
         )
         prev_actions = torch.zeros(
-            self.config.habitat_baselines.num_environments,
+            eval_num_envs,
             *action_shape,
             device=self.device,
             dtype=torch.long if discrete_actions else torch.float,
         )
         not_done_masks = torch.zeros(
-            self.config.habitat_baselines.num_environments,
+            eval_num_envs,
             1,
             device=self.device,
             dtype=torch.bool,
@@ -1530,9 +1579,7 @@ class PPOTrainer(BaseRLTrainer):
         ep_eval_count: Dict[Any, int] = defaultdict(lambda: 0)
 
         infos = None
-        rgb_frames = [
-            [] for _ in range(self.config.habitat_baselines.num_environments)
-        ]  # type: List[List[np.ndarray]]
+        rgb_frames = [[] for _ in range(eval_num_envs)]  # type: List[List[np.ndarray]]
         if len(self.config.habitat_baselines.video_option) > 0:
             os.makedirs(self.config.habitat_baselines.video_dir, exist_ok=True)
 
